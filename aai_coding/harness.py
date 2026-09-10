@@ -5,16 +5,33 @@ from pathlib import Path
 
 __all__ = ['main']
 
-NO_TRUNCATE = ('Output pipe truncates below 20 lines. Drop the pipe or keep >=20: truncation is decided '
-    'before the output exists, so keep enough to diagnose surprises.')
-NO_STDERR_MERGE = ('Do not merge stderr into stdout with 2>&1. Run the command bare: the harness pushes large '
-    'output to a file by itself, and stderr kept separate makes a crash unmissable.')
+NO_TRUNCATE = 'Output pipe truncates below 20 lines. Drop the pipe or keep >=20: truncation is decided before the output exists, so keep enough to diagnose surprises.'
+NO_STDERR_MERGE = 'Do not merge stderr into stdout with 2>&1. Run the command bare: the harness pushes large output to a file by itself, and stderr kept separate makes a crash unmissable.'
 # Two ways a head/tail pipe truncates below 20: an explicit count under 20, or no count at all -
 # bare `head`/`tail` default to 10, so `| head` cuts exactly as hard as the `| head -10` we reject.
+# `-1` is deliberately outside the range: `ls -t | head -1`, `df -h / | tail -n 1`, `wc -l | tail -1`
+# are selectors, where the single line IS the answer and keeping 20 would answer a different
+# question. Measured 09-05..09-10 it was 21% of this rule's rejections and never a real catch.
 _TRUNC = re.compile(r'\|\s*(?:tail|head)'
-                    r'(?:\s+(?:-n\s*)?-?(?:[1-9]|1[0-9])\b'  # explicit: -5, -n 5, -19
+                    r'(?:\s+(?:-n\s*)?-?(?:[2-9]|1[0-9])\b'  # explicit: -5, -n 5, -19
                     r'|(?=\s*(?:$|[|;&\n])))')                # bare: defaults to 10
 _MERGE = re.compile(r'2>\s*&\s*1')
+_DO, _DONE = re.compile(r'\bdo\b'), re.compile(r'\bdone\b')
+
+
+def _loop_spans(cmd):
+    "Character ranges between a shell `do` and its matching `done`"
+    marks = sorted([(m.start(), 1) for m in _DO.finditer(cmd)] +
+                   [(m.end(), -1) for m in _DONE.finditer(cmd)])
+    spans, depth, start = [], 0, None
+    for pos, d in marks:
+        if d == 1:
+            if not depth: start = pos
+            depth += 1
+        elif depth:                      # a bare `done` (e.g. `echo done`) opens nothing
+            depth -= 1
+            if not depth: spans.append((start, pos)); start = None
+    return spans
 
 
 def bash_guard_msg(cmd):
@@ -25,34 +42,34 @@ def bash_guard_msg(cmd):
     # 2>&1` loop conditions, and `2>&1 | tail -N` where N was already >=20.
     # Set AAI_BASH_GUARD_STDERR=1 to restore upstream behaviour.
     if os.environ.get('AAI_BASH_GUARD_STDERR') and _MERGE.search(cmd): return NO_STDERR_MERGE
-    return NO_TRUNCATE if _TRUNC.search(cmd) else None
+    # A truncating pipe inside a `do ... done` body runs once per item, so the floor multiplies:
+    # `for c in $(docker ps -q); do docker logs $c | tail -12; done` over 38 containers is already
+    # ~450 lines, and forcing >=20 each would push it past 760 and make it LESS diagnosable. Only
+    # a pipe outside every loop body is judged. 16% of rejections were per-item summaries.
+    spans = _loop_spans(cmd)
+    if any(not any(a <= m.start() < b for a, b in spans) for m in _TRUNC.finditer(cmd)):
+        return NO_TRUNCATE
+    return None
 
 
-Q_NOTICE = ('This prompt ends with a question mark, so it seems to be a question. Claude Code bug: a tool call '
-    'after your answer text hides the answer. Do all your tool calls first, as many as the question needs, '
-    'then write the answer and stop.')
-READ_NOTICE = ('This prompt appears to contain a request to read something. If it could reasonably be interpreted that way, '
-    'read the target in full NOW, before composing any response: a notebook via summary_dlg then view_dlg/find_msgs as needed; '
-    'a .py or other text file in full. Never respond from assumed or remembered contents.')
-APPROVAL_NOTICE = ('This bare approval covers exactly what was explicitly agreed, nothing more. Before '
-    'acting, check that each thing you are about to do was confirmed by the user - not merely proposed, '
-    'listed, or summarized by you. If approval of any item is uncertain, it is not approved: ask.')
+Q_NOTICE = 'This prompt ends with a question mark, so it seems to be a question. Claude Code bug: a tool call after your answer text hides the answer. Do all your tool calls first, as many as the question needs, then write the answer and stop.'
+READ_NOTICE = 'This prompt appears to contain a request to read something. If it could reasonably be interpreted that way, read the target in full NOW, before composing any response: a notebook via summary_dlg then view_dlg/find_msgs as needed; a .py or other text file in full. Never respond from assumed or remembered contents.'
+APPROVAL_NOTICE = 'This bare approval covers exactly what was explicitly agreed, nothing more. Before acting, check that each thing you are about to do was confirmed by the user - not merely proposed, listed, or summarized by you. If approval of any item is uncertain, it is not approved: ask.'
 
 
-Q_NOTICE_CODEX = ('This prompt ends with a question mark, so it seems to be a question. Answer it directly, '
-    'making only the tool calls needed to get the answer, before and instead of any further work.')
-BTW_NOTICE = ('This prompt begins with `BTW ` and is a side request. Answer it first, then resume the '
-    'previously active task if it still has unfinished items. Do not treat the side request as replacing '
-    'or cancelling that task unless the user explicitly says so.')
+Q_NOTICE_CODEX = 'This prompt ends with a question mark, so it seems to be a question. Answer it directly, making only the tool calls needed to get the answer, before and instead of any further work.'
+BTW_NOTICE = 'This prompt begins with `BTW ` and is a side request. Answer it first, then resume the previously active task if it still has unfinished items. Do not treat the side request as replacing or cancelling that task unless the user explicitly says so.'
+SLOP_CAVEAT = 'The user sent a bare "\'": your previous reply appears to end with an unnecessary caveat. Identify what you meant: a concrete obstacle requiring a user decision, an ordinary implementation or testing task, or an unsupported hypothetical concern. If it requires a decision, explain the obstacle, its consequence, and the decision needed. If it is routine work, say so without implying the plan’s feasibility is uncertain. If it is unsupported or irrelevant to the question, withdraw it. Do not invent a justification for having included it.'
 
 
 def prompt_notices(prompt, q_notice=Q_NOTICE):
-    "Notices a submitted prompt earns: question-mark answer-first, read-in-full, bare-approval scope, and BTW side-request"
+    "Notices for questions, reading requests, bare approvals, BTW side-requests, and the apostrophe caveat check"
     out = []
     if prompt.rstrip().endswith('?'): out.append(q_notice)
     if 'please read' in prompt.lower(): out.append(READ_NOTICE)
     if re.sub(r'^\s+|[\s.!]+$', '', prompt.lower()) in ('go', 'ok'): out.append(APPROVAL_NOTICE)
     if prompt.startswith('BTW '): out.append(BTW_NOTICE)
+    if prompt.strip() == "'": out.append(SLOP_CAVEAT)
     return out
 
 
@@ -217,14 +234,8 @@ def claude_drop_sentinel(o):
 
 
 SLOP_WORST, SLOP_DENSITY, SLOP_WORDS, SLOP_TOP = 10, 10, 40, 8
-SLOP_MSG = ("slopometer: your previous turn's final message scored density {d} (flag threshold {t}), worst finding {w}. "
-    'The rows below apply to your own prose only: a span that is a quoted example, discussed text, or a title needs no change. '
-    'Write your reply to the prompt above in the reference register, avoiding these patterns.\n{rows}')
-SLOP_RESTATE = ('The user sent a bare ";": they did not understand your previous reply. Restate it in simple precise English: '
-    'short sentences, named actors, plain words, no joins, and define every term you keep.')
-SLOP_CAVEAT = ('The user sent a bare "\'": your previous reply appears to contain a caveat in the last or penultimate paragraph, and they cannot tell whether it is '
-    'a real critical issue they must fully understand and respond to before proceeding, or an LLM sign-off habit they need not act on. '
-    'Say plainly which it is. If real, restate the issue, what hangs on it, and what response it needs; if habit, withdraw it.')
+SLOP_MSG = "slopometer: your previous turn's final message scored density {d} (flag threshold {t}), worst finding {w}. The rows below apply to your own prose only: a span that is a quoted example, discussed text, or a title needs no change. Write your reply to the prompt above in the reference register, avoiding these patterns.\n{rows}"
+SLOP_RESTATE = 'The user sent a bare ";": they did not understand your previous reply. Restate it in simple precise English: short sentences, named actors, plain words, no joins, and define every term you keep.'
 
 
 _SLOP_KEYS = dict(mid='', buf='', last='', lastmid='', done='')
@@ -270,7 +281,6 @@ def claude_slop(o):
             return
         notes = []
         if (o.get('prompt') or '').strip() == ';': notes.append(SLOP_RESTATE)
-        if (o.get('prompt') or '').strip() == "'": notes.append(SLOP_CAVEAT)
         txt, fresh = st['last'], st['lastmid'] != st['done']
         if txt and fresh:
             st['done'] = st['lastmid']
@@ -288,13 +298,9 @@ def codex_orientation(o):
     marker = markers/f"{o['session_id']}.json"
     event = o['hook_event_name']
     import llmdojo
-    message = ('Context was compacted, so the clikernel documentation is no longer in context. Read the startup documentation in '
-        'two separate calls: first `doc(clik,pysk,edsk)`, then `doc(dsk,exh,rgsk)`. Run `doc()` for '
-        'anything else you need as you continue. Do not rerun the dojo. After running the two `doc()` calls, retry your last tool '
-        'call; it should now work. Then continue your existing task if it is not complete.')
+    message = 'Context was compacted, so the clikernel documentation is no longer in context. Read the startup documentation in two separate calls: first `doc(clik,pysk,edsk)`, then `doc(dsk,exh,rgsk)`. Run `doc()` for anything else you need as you continue. Do not rerun the dojo. After running the two `doc()` calls, retry your last tool call; it should now work. Then continue your existing task if it is not complete.'
     sample = (Path(llmdojo.__file__).parent/'dojo_data/codexdojo_sample.md').read_text()
-    message += ('\n\nThe following is a sample usage session from before compaction. Treat it as reference '
-        'for correct tool usage; do not repeat or score it.\n\n') + sample
+    message += '\n\nThe following is a sample usage session from before compaction. Treat it as reference for correct tool usage; do not repeat or score it.\n\n' + sample
     if event == 'PostCompact':
         markers.mkdir(parents=True, exist_ok=True)
         marker.write_text(json.dumps(dict(turn_id=o.get('turn_id'))))
