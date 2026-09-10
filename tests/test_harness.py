@@ -35,6 +35,27 @@ def test_bash_guard():
     assert bash_guard_msg('pytest -q 2>&1 | tail -5')   # truncation still bites through a merge
 
 
+def test_bash_guard_selectors():
+    "`-1` extracts one specific value; keeping 20 would answer a different question"
+    assert bash_guard_msg('ls -t ~/backups/*.tgz | head -1') is None
+    assert bash_guard_msg('df -h / | tail -n 1') is None
+    assert bash_guard_msg('git log --format=%H | head -1') is None
+    assert bash_guard_msg('wc -l < f | tail -1') is None
+    assert bash_guard_msg('ls ~ | head -2')             # -2 truncates again, it is not a selector
+
+
+def test_bash_guard_loop_bodies():
+    "A pipe in a `do ... done` body runs per item, so the floor multiplies instead of protecting"
+    assert bash_guard_msg('for c in $(docker ps -q); do docker logs $c | tail -12; done') is None
+    assert bash_guard_msg('for f in *.log; do grep ERROR $f | head -5; done') is None
+    assert bash_guard_msg('while read l; do echo $l | head -3; done < list.txt') is None
+    assert bash_guard_msg('for j in a b; do for t in 1 2; do cat $t | tail -4; done; done') is None
+    # a pipe outside every loop body is still judged
+    assert bash_guard_msg('for f in *; do echo $f; done; tar tzf x.tgz | head -5')
+    # `done` that opens no loop must not create a span
+    assert bash_guard_msg('ls | head -5; echo done')
+
+
 def test_bash_guard_stderr_optin(monkeypatch):
     "AAI_BASH_GUARD_STDERR=1 restores the upstream stderr-merge rejection"
     monkeypatch.setenv('AAI_BASH_GUARD_STDERR', '1')

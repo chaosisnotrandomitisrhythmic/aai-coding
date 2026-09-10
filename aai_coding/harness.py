@@ -9,10 +9,29 @@ NO_TRUNCATE = 'Output pipe truncates below 20 lines. Drop the pipe or keep >=20:
 NO_STDERR_MERGE = 'Do not merge stderr into stdout with 2>&1. Run the command bare: the harness pushes large output to a file by itself, and stderr kept separate makes a crash unmissable.'
 # Two ways a head/tail pipe truncates below 20: an explicit count under 20, or no count at all -
 # bare `head`/`tail` default to 10, so `| head` cuts exactly as hard as the `| head -10` we reject.
+# `-1` is deliberately outside the range: `ls -t | head -1`, `df -h / | tail -n 1`, `wc -l | tail -1`
+# are selectors, where the single line IS the answer and keeping 20 would answer a different
+# question. Measured 09-05..09-10 it was 21% of this rule's rejections and never a real catch.
 _TRUNC = re.compile(r'\|\s*(?:tail|head)'
-                    r'(?:\s+(?:-n\s*)?-?(?:[1-9]|1[0-9])\b'  # explicit: -5, -n 5, -19
+                    r'(?:\s+(?:-n\s*)?-?(?:[2-9]|1[0-9])\b'  # explicit: -5, -n 5, -19
                     r'|(?=\s*(?:$|[|;&\n])))')                # bare: defaults to 10
 _MERGE = re.compile(r'2>\s*&\s*1')
+_DO, _DONE = re.compile(r'\bdo\b'), re.compile(r'\bdone\b')
+
+
+def _loop_spans(cmd):
+    "Character ranges between a shell `do` and its matching `done`"
+    marks = sorted([(m.start(), 1) for m in _DO.finditer(cmd)] +
+                   [(m.end(), -1) for m in _DONE.finditer(cmd)])
+    spans, depth, start = [], 0, None
+    for pos, d in marks:
+        if d == 1:
+            if not depth: start = pos
+            depth += 1
+        elif depth:                      # a bare `done` (e.g. `echo done`) opens nothing
+            depth -= 1
+            if not depth: spans.append((start, pos)); start = None
+    return spans
 
 
 def bash_guard_msg(cmd):
@@ -23,7 +42,14 @@ def bash_guard_msg(cmd):
     # 2>&1` loop conditions, and `2>&1 | tail -N` where N was already >=20.
     # Set AAI_BASH_GUARD_STDERR=1 to restore upstream behaviour.
     if os.environ.get('AAI_BASH_GUARD_STDERR') and _MERGE.search(cmd): return NO_STDERR_MERGE
-    return NO_TRUNCATE if _TRUNC.search(cmd) else None
+    # A truncating pipe inside a `do ... done` body runs once per item, so the floor multiplies:
+    # `for c in $(docker ps -q); do docker logs $c | tail -12; done` over 38 containers is already
+    # ~450 lines, and forcing >=20 each would push it past 760 and make it LESS diagnosable. Only
+    # a pipe outside every loop body is judged. 16% of rejections were per-item summaries.
+    spans = _loop_spans(cmd)
+    if any(not any(a <= m.start() < b for a, b in spans) for m in _TRUNC.finditer(cmd)):
+        return NO_TRUNCATE
+    return None
 
 
 Q_NOTICE = 'This prompt ends with a question mark, so it seems to be a question. Claude Code bug: a tool call after your answer text hides the answer. Do all your tool calls first, as many as the question needs, then write the answer and stop.'
