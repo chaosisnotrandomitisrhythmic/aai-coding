@@ -19,7 +19,12 @@ _MERGE = re.compile(r'2>\s*&\s*1')
 
 def bash_guard_msg(cmd):
     "The objection `cmd` earns - a sub-20-line head/tail pipe, or a 2>&1 stderr merge - else None"
-    if _MERGE.search(cmd): return NO_STDERR_MERGE
+    # Fork-local: the stderr-merge rule is opt-in. Measured 2026-09-02..09-10 it fired ~60 times
+    # and caught nothing the truncation rule missed; every rejection unique to it was a legitimate
+    # idiom - `>> "$LOG" 2>&1`, `> out.txt 2>&1`, `ls a b c 2>&1` existence probes, `>/dev/null
+    # 2>&1` loop conditions, and `2>&1 | tail -N` where N was already >=20.
+    # Set AAI_BASH_GUARD_STDERR=1 to restore upstream behaviour.
+    if os.environ.get('AAI_BASH_GUARD_STDERR') and _MERGE.search(cmd): return NO_STDERR_MERGE
     return NO_TRUNCATE if _TRUNC.search(cmd) else None
 
 
