@@ -26,9 +26,22 @@ def test_bash_guard():
     assert bash_guard_msg('ls | header') is None           # a command that merely starts with `head`
     assert bash_guard_msg('tail -f app.log') is None       # no pipe, and follow mode truncates nothing
     assert bash_guard_msg('cat f | head -c 200') is None   # bytes, not lines: out of scope either way
-    assert bash_guard_msg('pytest -q 2>&1 | tail -20')
+    assert bash_guard_msg('pytest -q >meta/stdout.txt 2>meta/stderr.txt') is None
+    # fork default: the stderr-merge rule is off, so these are the caller's business
+    assert bash_guard_msg('pytest -q 2>&1 | tail -20') is None
+    assert bash_guard_msg('maturin develop 2>&1') is None
+    assert bash_guard_msg('foo 2> &1') is None
+    assert bash_guard_msg('make >> "$LOG" 2>&1') is None
+    assert bash_guard_msg('ls -d a b c 2>&1') is None
+    assert bash_guard_msg('pytest -q 2>&1 | tail -5')   # truncation still bites through a merge
+
+
+def test_bash_guard_stderr_optin(monkeypatch):
+    "AAI_BASH_GUARD_STDERR=1 restores the upstream stderr-merge rejection"
+    monkeypatch.setenv('AAI_BASH_GUARD_STDERR', '1')
     assert bash_guard_msg('maturin develop 2>&1')
     assert bash_guard_msg('foo 2> &1')
+    assert bash_guard_msg('pytest -q 2>&1 | tail -20')
     assert bash_guard_msg('pytest -q >meta/stdout.txt 2>meta/stderr.txt') is None
 
 
